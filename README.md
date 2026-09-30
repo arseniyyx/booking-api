@@ -1,27 +1,24 @@
-# Booking API
+# booking-api
 
-A backend for booking shared resources (meeting rooms, desks, equipment) built with
-**FastAPI**, **async SQLAlchemy 2**, and **PostgreSQL**.
+A small backend for booking shared stuff: meeting rooms, desks, a projector, whatever.
+FastAPI + async SQLAlchemy + PostgreSQL.
 
-The interesting part: **double bookings are impossible, even under concurrent requests.**
-Overlap protection lives in the database as a PostgreSQL exclusion constraint, not in an
-application-level "check then insert" that races. A test fires ten simultaneous requests for
-the same slot and asserts exactly one succeeds.
+I built it around one question: how do you make sure two people can't book the same room
+for the same time, even if they click "book" at the exact same moment?
 
-![CI](../../actions/workflows/ci.yml/badge.svg)
+## The double-booking problem
 
-## Features
+The obvious way is to check for overlaps and then insert:
 
-- JWT authentication (register, login, `/users/me`) with bcrypt password hashing
-- Role-based access: regular users book, admins manage resources and see all bookings
-- Resources CRUD with pagination and soft deactivation
-- Bookings: create, list with filters, view, cancel (idempotent), busy-slot lookup
-- Business rules: bookings must be in the future, 15 min to 8 h long, timezone-aware
-- Privacy: users get `404` for other people's bookings; busy slots expose no user data
-- Alembic migrations; tests run against the real migrated schema
-- Docker Compose for local run, GitHub Actions CI (lint, format, tests, image build)
+```python
+if not await has_overlap(room, start, end):
+    await insert_booking(...)
+```
 
-## How double booking is prevented
+This breaks under load. Two requests run the check at the same time, both see a free slot,
+both insert. You end up with two bookings for 10:00 in the same room.
+
+Instead of locking in the app, I let Postgres enforce it with an exclusion constraint:
 
 ```sql
 ALTER TABLE bookings ADD CONSTRAINT ex_bookings_no_overlap
@@ -29,30 +26,45 @@ EXCLUDE USING gist (resource_id WITH =, tstzrange(start_at, end_at, '[)') WITH &
 WHERE (status = 'confirmed');
 ```
 
-- `tstzrange(start, end, '[)')` is half-open, so back-to-back bookings (10:00–11:00 and
-  11:00–12:00) are allowed.
-- The `WHERE` clause makes cancelled bookings free up their slot.
-- `btree_gist` lets one GiST index combine `=` on `resource_id` with `&&` (overlap) on the range.
-- The API maps PostgreSQL error `23P01` (exclusion violation) to `409 Conflict`.
+In plain words: for the same `resource_id`, no two confirmed time ranges may overlap.
 
-A naive `SELECT ... WHERE overlaps` followed by `INSERT` lets two concurrent requests both
-see a free slot and both insert. The constraint closes that race without explicit locks.
+A few details that matter:
 
-## Run it
+- `'[)'` makes the range half-open, so 10:00-11:00 and 11:00-12:00 don't conflict.
+- The `WHERE` clause means a cancelled booking frees its slot right away.
+- `btree_gist` is needed so one index can combine `=` on an integer with `&&` on a range.
+- When the constraint fires, Postgres returns error `23P01`. The API turns that into `409 Conflict`.
+
+There's a test that sends 10 booking requests for the same slot at once. Exactly one gets
+`201`, the other nine get `409`.
+
+## What else is in here
+
+- Register / login with JWT, passwords hashed with bcrypt
+- Two roles: users book things, admins manage resources and can see all bookings
+- Resources: CRUD, pagination, can be deactivated instead of deleted
+- Bookings: create, list with filters, cancel (calling cancel twice is fine)
+- A "busy slots" endpoint so a frontend can draw a calendar without seeing who booked what
+- If you ask for someone else's booking you get `404`, not `403`, so ids can't be probed
+- Validation: must be in the future, 15 min to 8 h, timezone required
+- Alembic migrations, and the tests run against the real migrated schema
+- Docker Compose, GitHub Actions (lint, format, tests, docker build)
+
+## Running it
 
 ```bash
 docker compose up --build
-# API:  http://localhost:8000
-# Docs: http://localhost:8000/docs
 ```
 
-Make yourself an admin after registering:
+API on http://localhost:8000, Swagger docs on http://localhost:8000/docs.
+
+To make yourself an admin after registering:
 
 ```bash
 docker compose exec api python -m app.cli promote you@example.com
 ```
 
-### Try it with curl
+Quick try with curl:
 
 ```bash
 curl -X POST localhost:8000/auth/register -H 'Content-Type: application/json' \
@@ -66,53 +78,58 @@ curl -X POST localhost:8000/bookings -H "Authorization: Bearer $TOKEN" \
   -d '{"resource_id":1,"start_at":"2030-01-01T10:00:00Z","end_at":"2030-01-01T11:00:00Z"}'
 ```
 
-## API
+## Endpoints
 
-| Method | Path | Who | Description |
+| Method | Path | Who | What |
 |---|---|---|---|
-| POST | `/auth/register` | anyone | Create an account |
-| POST | `/auth/login` | anyone | Get a JWT (OAuth2 password form) |
-| GET | `/users/me` | user | Current user |
-| GET | `/resources` | user | List active resources (paginated) |
-| POST | `/resources` | admin | Create a resource |
-| GET / PATCH / DELETE | `/resources/{id}` | user / admin / admin | Read, update, delete |
-| GET | `/resources/{id}/busy?from=&to=` | user | Occupied time slots in a window |
-| POST | `/bookings` | user | Book a resource (`409` if taken) |
-| GET | `/bookings` | user | Own bookings; admins can pass `all_users=true` |
-| GET | `/bookings/{id}` | owner / admin | Booking details |
-| POST | `/bookings/{id}/cancel` | owner / admin | Cancel (idempotent) |
-| GET | `/health` | anyone | Liveness plus DB check |
+| POST | `/auth/register` | anyone | create account |
+| POST | `/auth/login` | anyone | get a token |
+| GET | `/users/me` | user | who am I |
+| GET | `/resources` | user | list active resources |
+| POST | `/resources` | admin | add a resource |
+| GET / PATCH / DELETE | `/resources/{id}` | user / admin / admin | read, edit, delete |
+| GET | `/resources/{id}/busy?from=&to=` | user | taken time slots |
+| POST | `/bookings` | user | book (`409` if taken) |
+| GET | `/bookings` | user | my bookings (admins: `all_users=true`) |
+| GET | `/bookings/{id}` | owner / admin | one booking |
+| POST | `/bookings/{id}/cancel` | owner / admin | cancel |
+| GET | `/health` | anyone | checks the DB too |
 
-Full interactive docs are generated by FastAPI at `/docs`.
+## Local development
 
-## Development
-
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and a PostgreSQL 16 instance.
+You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and Postgres 16.
 
 ```bash
 uv sync
-cp .env.example .env
 createdb booking_test
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/booking_test uv run pytest
 uv run ruff check . && uv run ruff format --check .
 ```
 
-Tests apply the Alembic migrations to the test database once per run and truncate tables
-between tests, so they exercise the exact production schema, constraint included.
+The test setup runs the Alembic migrations once and truncates tables between tests. I
+didn't want tests on `create_all()` because then the constraint above would only be tested
+in theory.
 
-## Project layout
+## Layout
 
 ```
 app/
-  main.py          FastAPI app and router wiring
-  config.py        Settings from environment variables
-  db.py            Async engine and session dependency
-  models.py        SQLAlchemy models, including the exclusion constraint
-  schemas.py       Pydantic request and response models
-  security.py      Password hashing and JWT
-  deps.py          Auth dependencies (current user, admin guard)
-  routers/         auth, resources, bookings
-  cli.py           Promote a user to admin
-migrations/        Alembic migrations
-tests/             pytest + httpx against a real PostgreSQL
+  main.py        app + routers
+  config.py      settings from env
+  db.py          engine, session
+  models.py      tables, including the exclusion constraint
+  schemas.py     request / response models
+  security.py    bcrypt + JWT
+  deps.py        current user, admin check
+  routers/       auth, resources, bookings
+  cli.py         promote a user to admin
+migrations/      alembic
+tests/           pytest + httpx, real Postgres
 ```
+
+## What I'd add next
+
+- Refresh tokens and logout
+- Recurring bookings ("every Monday 10:00")
+- Opening hours per resource
+- Rate limiting on login
